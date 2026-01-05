@@ -1,0 +1,1289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Silverback SERP Climb (Reachable Platforms + Subtle Stroke + Fall Death)</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #07080b;
+      overflow: hidden;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Apple Color Emoji","Segoe UI Emoji";
+    }
+    canvas { display:block; width:100vw; height:100vh; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script>
+(() => {
+  // =========================
+  // Theme
+  // =========================
+  const ACCENT = "#e95805"; // orange
+  const GOOGLE = {
+    blue:   "#4285F4",
+    red:    "#EA4335",
+    yellow: "#FBBC05",
+    green:  "#34A853",
+  };
+
+  // =========================
+  // Units / progression
+  // =========================
+  const METERS_PER_PIXEL = 0.10;     // 10px = 1m
+  const LEVEL_EVERY_METERS = 500;
+
+  // =========================
+  // Physics
+  // =========================
+  const PHYS = {
+    gravity: 2200,       // px/s^2 downward
+    moveAccel: 5200,     // px/s^2
+    maxMoveSpeed: 520,   // px/s
+    jumpVel: 880,        // px/s upward (negative vy)
+    airControl: 0.75,
+    friction: 0.82,
+    coyoteTime: 0.10,
+    jumpBuffer: 0.10,
+  };
+
+  // "Die if you fall below the starting zone"
+  // Starter platforms live around y≈20. If you drop well below that, you get punished.
+  const START_DEATH_Y = 300; // world y (positive is down)
+
+  // =========================
+  // World gen
+  // =========================
+  const WORLD = {
+    platformH: 18,
+    minPlatformW: 160,
+    maxPlatformW: 380,
+
+    // Reachability clamps: keeps gen from producing impossible jumps
+    minGapY: 86,
+    maxGapY: 142,          // MUST be <= jump height (~176px); keep some buffer
+    spawnAhead: 1400,
+    cullBelow: 900,
+  };
+
+  // =========================
+  // Tokens / Bugs / Lives
+  // =========================
+  const TOKENS = { radius: 10, score: 10 };
+
+  const BUGS = {
+    w: 36,
+    h: 22,
+    baseSpeed: 90,
+    damageIframes: 1.0,
+    minSpawnWidth: 240,
+    spawnWidthDecay: 12,
+    minSpawnWidthFloor: 180,
+  };
+
+  const GAME = {
+    startLives: 3,
+    heartsPerLife: 3,
+    respawnGrace: 0.6,
+  };
+
+  const HIT = {
+    knockbackX: 420,
+    knockbackY: 520,
+    stun: 0.12,
+  };
+
+  // =========================
+  // Gorilla styling (SUBTLE gray outline)
+  // =========================
+  const GOR = {
+    // subtle gray outline (not white, low alpha)
+    strokeColor: "rgba(170,175,185,0.35)",
+
+    fur:     "#0a0b10",
+    fur2:    "#141723",
+    hi:      "#6b70b8",
+    hi2:     "#4d4f86",
+    face:    "#9aa0ff",
+    eyeHot:  "#ffd38a",
+  };
+
+  // Set this to "almost nothing"
+  // Try 0.6, 0.8, 1.0, 1.2
+  const GOR_STROKE_PX = 0.9;
+
+  // =========================
+  // Canvas setup
+  // =========================
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+
+  function resize() {
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    canvas.width  = Math.floor(innerWidth * dpr);
+    canvas.height = Math.floor(innerHeight * dpr);
+    canvas.style.width = innerWidth + "px";
+    canvas.style.height = innerHeight + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // =========================
+  // Utilities
+  // =========================
+  const clamp  = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp   = (a, b, t) => a + (b - a) * t;
+  const rand   = (a, b) => a + Math.random() * (b - a);
+  const randi  = (a, b) => (a + Math.floor(Math.random() * (b - a + 1)));
+  const chance = (p) => Math.random() < p;
+
+  function cryptoRandomId() {
+    return (Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2)).slice(0, 12);
+  }
+
+  function roundedRectPath(x, y, w, h, r) {
+    r = Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function drawGlowCircle(x, y, r, color, glow=18, alpha=0.9) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = glow;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function aabb(ax, ay, aw, ah, bx, by, bw, bh) {
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  // =========================
+  // Input
+  // =========================
+  const keys = new Set();
+  const pressed = new Set();
+
+  window.addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    if (!keys.has(k)) pressed.add(k);
+    keys.add(k);
+
+    if ([" ", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(k) || e.code === "Space") {
+      e.preventDefault();
+    }
+  }, { passive:false });
+
+  window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
+
+  const isDown = (k) => keys.has(k);
+  const wasPressed = (k) => pressed.has(k);
+
+  // =========================
+  // Game state
+  // =========================
+  let state;
+
+  function resetGame() {
+    const w = innerWidth;
+
+    state = {
+      t: 0,
+      gameOver: false,
+      score: 0,
+
+      lives: GAME.startLives,
+      hearts: GAME.heartsPerLife,
+
+      cameraY: 0,
+      minPlayerY: 0,
+
+      checkpointLevel: 1,
+      checkpointY: 0,
+
+      platforms: [],
+      tokens: [],
+      bugs: [],
+
+      player: {
+        x: w * 0.5,
+        y: -80,
+        w: 44,
+        h: 58,
+        vx: 0,
+        vy: 0,
+
+        face: 1,
+        hitStun: 0,
+        hitDir: 1,
+
+        onGround: false,
+        groundId: null,
+        coyote: 0,
+        jumpBuffer: 0,
+
+        invuln: 0,
+        respawnInvuln: 0,
+      },
+
+      nodes: Array.from({length: 60}, () => ({
+        x: rand(0, innerWidth),
+        y: rand(0, innerHeight),
+        r: rand(1.5, 3.8),
+        c: [GOOGLE.blue, GOOGLE.red, GOOGLE.yellow, GOOGLE.green, ACCENT][randi(0,4)],
+        s: rand(8, 30),
+      })),
+    };
+
+    // Starter platforms (hand-placed)
+    const baseY = 20;
+    addPlatform(innerWidth * 0.5 - 180, baseY,        360, "static");
+    addPlatform(innerWidth * 0.25 - 140, baseY - 140, 280, "static");
+    addPlatform(innerWidth * 0.70 - 170, baseY - 270, 320, "static");
+    addPlatform(innerWidth * 0.45 - 140, baseY - 400, 280, "static");
+    addPlatform(innerWidth * 0.20 - 120, baseY - 530, 240, "static");
+    addPlatform(innerWidth * 0.72 - 150, baseY - 660, 300, "static");
+
+    // sprinkle tokens
+    for (let i = 0; i < 8; i++) spawnTokenNearTop();
+
+    // seed a couple bugs
+    maybeSpawnBugOnPlatform(state.platforms[2], 1);
+    maybeSpawnBugOnPlatform(state.platforms[4], 1);
+
+    generateAbove();
+  }
+
+  // =========================
+  // Difficulty
+  // =========================
+  function currentMeters() {
+    return Math.max(0, Math.floor((-state.minPlayerY) * METERS_PER_PIXEL));
+  }
+  function currentLevel() {
+    return Math.floor(currentMeters() / LEVEL_EVERY_METERS) + 1;
+  }
+  function levelProgress() {
+    const m = currentMeters();
+    const base = (currentLevel() - 1) * LEVEL_EVERY_METERS;
+    return (m - base) / LEVEL_EVERY_METERS;
+  }
+  function difficulty() {
+    const L = currentLevel();
+    return 1 + Math.log2(1 + (L-1) * 0.65) * 0.55;
+  }
+  function bugMinPlatformWidth() {
+    const L = currentLevel();
+    return Math.max(BUGS.minSpawnWidthFloor, BUGS.minSpawnWidth - (L - 1) * BUGS.spawnWidthDecay);
+  }
+
+  // =========================
+  // World + generation (REACHABLE)
+  // =========================
+  function addPlatform(x, y, w, kind="static") {
+    const p = {
+      id: cryptoRandomId(),
+      x, y, w, h: WORLD.platformH,
+      kind,
+      vx: 0,
+      minX: x,
+      maxX: x,
+    };
+
+    if (kind === "moving") {
+      const range = rand(90, 220);
+      p.minX = clamp(x - range, 10, innerWidth - w - 10);
+      p.maxX = clamp(x + range, 10, innerWidth - w - 10);
+      p.vx = rand(40, 80) * (chance(0.5) ? 1 : -1);
+    }
+
+    state.platforms.push(p);
+    return p;
+  }
+
+  function highestPlatform() {
+    let best = null;
+    for (const p of state.platforms) {
+      if (!best || p.y < best.y) best = p; // smallest y = highest up
+    }
+    return best;
+  }
+
+  function makeToken(x, y) {
+    const colors = [GOOGLE.blue, GOOGLE.red, GOOGLE.yellow, GOOGLE.green, ACCENT];
+    return { id: cryptoRandomId(), x, y, r: TOKENS.radius, c: colors[randi(0, colors.length-1)], wob: rand(0, Math.PI*2) };
+  }
+
+  function spawnTokenNearTop() {
+    const p = state.platforms[randi(0, state.platforms.length-1)];
+    state.tokens.push(makeToken(rand(p.x+16, p.x+p.w-16), p.y - rand(28, 56)));
+  }
+
+  function maybeSpawnBugOnPlatform(platform, d) {
+    if (!platform) return;
+    if (platform.w < bugMinPlatformWidth()) return;
+
+    const speed = BUGS.baseSpeed * (0.9 + d * 0.35);
+    state.bugs.push({
+      id: cryptoRandomId(),
+      pId: platform.id,
+      x: rand(platform.x + 12, platform.x + platform.w - BUGS.w - 12),
+      y: platform.y - BUGS.h,
+      w: BUGS.w,
+      h: BUGS.h,
+      dir: chance(0.5) ? 1 : -1,
+      speed,
+      wiggle: rand(0, Math.PI*2),
+    });
+  }
+
+  // Compute time to reach a higher platform at vertical gap dy (positive px upward)
+  // Using y(t) = -jumpVel*t + 0.5*g*t^2, solve for y = -dy.
+  function timeToHeightDescending(dy) {
+    const g = PHYS.gravity;
+    const v = PHYS.jumpVel;
+    const disc = v*v - 2*g*dy;
+    if (disc <= 0) return null; // unreachable
+    const sqrt = Math.sqrt(disc);
+    // t2 is the later time (descending through that height)
+    return (v + sqrt) / g;
+  }
+
+  function generateAbove() {
+    const d = difficulty();
+    const L = currentLevel();
+
+    // platform widths shrink gently with difficulty
+    const widthMin = Math.max(110, WORLD.minPlatformW - (d-1) * 14);
+    const widthMax = Math.max(180, WORLD.maxPlatformW - (d-1) * 18);
+
+    // vertical gaps increase a bit, but CLAMPED to remain jumpable
+    const gapMax = clamp(WORLD.maxGapY + (d-1) * 6, WORLD.maxGapY, 152);
+    const gapMin = clamp(WORLD.minGapY + (d-1) * 2, WORLD.minGapY, 110);
+
+    // moving platforms increase, but still mild
+    const movingChance = clamp(0.04 + (L-1) * 0.010, 0.04, 0.26);
+
+    // token density decreases a bit
+    const tokenChance = clamp(0.65 - (d-1)*0.11, 0.22, 0.65);
+
+    // bug frequency increases
+    const bugChance = clamp(0.18 + (d-1)*0.09, 0.18, 0.70);
+
+    let anchor = highestPlatform();
+    if (!anchor) return;
+
+    let y = anchor.y;
+    let cx = anchor.x + anchor.w * 0.5;
+
+    const targetY = state.cameraY - WORLD.spawnAhead;
+
+    while (y > targetY) {
+      // choose a reachable vertical gap
+      const dy = rand(gapMin, gapMax); // px upward (world y decreases)
+      y -= dy;
+
+      // compute a safe horizontal reach for THIS dy
+      const tDesc = timeToHeightDescending(dy);
+      // if something weird happens, fall back to conservative distance
+      const maxDx = tDesc
+        ? (PHYS.maxMoveSpeed * 0.86) * tDesc + 40   // some slack
+        : 260;
+
+      // choose platform width
+      const w = rand(widthMin, widthMax);
+
+      // pick next center x near previous, within reachable dx
+      const nextCx = clamp(
+        cx + rand(-maxDx*0.75, maxDx*0.75),
+        18 + w*0.5,
+        innerWidth - 18 - w*0.5
+      );
+
+      const x = nextCx - w*0.5;
+
+      const kind = (L >= 3 && chance(movingChance)) ? "moving" : "static";
+      const p = addPlatform(x, y, w, kind);
+
+      // tokens
+      if (chance(tokenChance)) {
+        const n = randi(1, chance(0.22) ? 5 : 3);
+        for (let i=0; i<n; i++) {
+          state.tokens.push(makeToken(
+            rand(p.x + 14, p.x + p.w - 14),
+            p.y - rand(22, 54)
+          ));
+        }
+      }
+
+      // bugs
+      if (p.w >= bugMinPlatformWidth() && chance(bugChance)) {
+        maybeSpawnBugOnPlatform(p, d);
+      }
+
+      // occasional “step” platform (also constrained)
+      if (chance(0.20)) {
+        const dy2 = rand(gapMin*0.55, gapMax*0.75);
+        const t2 = timeToHeightDescending(dy2) || 0.55;
+        const maxDx2 = (PHYS.maxMoveSpeed * 0.82) * t2 + 30;
+
+        const w2 = rand(widthMin, widthMax * 0.9);
+        const y2 = y - dy2;
+
+        const cx2 = clamp(
+          nextCx + rand(-maxDx2*0.70, maxDx2*0.70),
+          18 + w2*0.5,
+          innerWidth - 18 - w2*0.5
+        );
+        const x2 = cx2 - w2*0.5;
+
+        const kind2 = (L >= 4 && chance(movingChance*0.80)) ? "moving" : "static";
+        const p2 = addPlatform(x2, y2, w2, kind2);
+
+        if (chance(tokenChance * 0.85)) {
+          state.tokens.push(makeToken(rand(p2.x+14, p2.x+p2.w-14), p2.y - rand(22, 50)));
+        }
+        if (p2.w >= bugMinPlatformWidth() && chance(bugChance * 0.7)) {
+          maybeSpawnBugOnPlatform(p2, d);
+        }
+
+        // continue from the highest of the two we just made
+        if (p2.y < p.y) {
+          y = p2.y;
+          cx = cx2;
+        } else {
+          cx = nextCx;
+        }
+      } else {
+        cx = nextCx;
+      }
+    }
+  }
+
+  function cullBelow() {
+    const cut = state.cameraY + innerHeight + WORLD.cullBelow;
+
+    state.platforms = state.platforms.filter(p => p.y < cut);
+    state.tokens = state.tokens.filter(t => t.y < cut);
+
+    const alivePlatformIds = new Set(state.platforms.map(p => p.id));
+    state.bugs = state.bugs.filter(b => alivePlatformIds.has(b.pId) && b.y < cut);
+
+    if (state.player.groundId && !alivePlatformIds.has(state.player.groundId)) {
+      state.player.groundId = null;
+      state.player.onGround = false;
+    }
+  }
+
+  // =========================
+  // Damage / Respawn
+  // =========================
+  function takeHit(fell=false, hitter=null) {
+    if (state.gameOver) return;
+    const pl = state.player;
+
+    pl.invuln = BUGS.damageIframes;
+
+    if (fell) {
+      state.hearts = 0;
+    } else {
+      state.hearts = Math.max(0, state.hearts - 1);
+
+      // flinch / knockback
+      const bugCx = hitter ? (hitter.x + hitter.w * 0.5) : (pl.x + pl.w * 0.5 + 20);
+      const plCx  = pl.x + pl.w * 0.5;
+      const dir = (plCx < bugCx) ? -1 : 1;
+
+      pl.hitDir = dir;
+      pl.vx = dir * HIT.knockbackX;
+      pl.vy = -HIT.knockbackY;
+      pl.hitStun = HIT.stun;
+
+      pl.x += dir * 6;
+      pl.y -= 2;
+
+      if (state.hearts > 0) return;
+    }
+
+    // lose a life
+    state.lives -= 1;
+
+    if (state.lives <= 0) {
+      state.gameOver = true;
+      return;
+    }
+
+    state.hearts = GAME.heartsPerLife;
+
+    // respawn near checkpoint
+    const targetY = state.checkpointY;
+    const candidates = state.platforms
+      .filter(p => p.y > targetY - 420 && p.y < targetY + 420)
+      .sort((a,b)=>Math.abs(a.y-targetY)-Math.abs(b.y-targetY));
+
+    const p = candidates[0] || state.platforms.sort((a,b)=>b.y-a.y)[0];
+
+    pl.x = p.x + p.w * 0.5 - pl.w * 0.5;
+    pl.y = p.y - pl.h - 2;
+    pl.vx = 0;
+    pl.vy = fell ? -PHYS.jumpVel * 0.25 : 0;
+
+    pl.respawnInvuln = GAME.respawnGrace;
+    pl.hitStun = 0;
+    pl.onGround = false;
+    pl.groundId = null;
+    pl.coyote = 0;
+
+    // snap camera to player so you don't stare into void
+    state.cameraY = pl.y - innerHeight * 0.42;
+
+    generateAbove();
+  }
+
+  // =========================
+  // Update
+  // =========================
+  function update(dt) {
+    state.t += dt;
+    const pl = state.player;
+
+    // checkpoint every 500m
+    const L = currentLevel();
+    if (L > state.checkpointLevel) {
+      state.checkpointLevel = L;
+      state.checkpointY = -((L-1) * LEVEL_EVERY_METERS) / METERS_PER_PIXEL + 120;
+      generateAbove();
+    }
+
+    // input
+    const left  = isDown("a") || isDown("arrowleft");
+    const right = isDown("d") || isDown("arrowright");
+    const jumpPressed = wasPressed(" ") || wasPressed("w") || wasPressed("arrowup");
+    if (jumpPressed) pl.jumpBuffer = PHYS.jumpBuffer;
+
+    // timers
+    pl.coyote = Math.max(0, pl.coyote - dt);
+    pl.jumpBuffer = Math.max(0, pl.jumpBuffer - dt);
+    pl.invuln = Math.max(0, pl.invuln - dt);
+    pl.respawnInvuln = Math.max(0, pl.respawnInvuln - dt);
+    pl.hitStun = Math.max(0, pl.hitStun - dt);
+
+    // control reduction during hit stun
+    const control = (pl.hitStun > 0) ? 0.15 : 1.0;
+    const accelBase = PHYS.moveAccel * (pl.onGround ? 1 : PHYS.airControl);
+    const accel = accelBase * control;
+
+    if (left)  pl.vx -= accel * dt;
+    if (right) pl.vx += accel * dt;
+
+    if (!left && !right) {
+      const f = Math.pow(PHYS.friction, dt * 60);
+      pl.vx *= f;
+    }
+
+    pl.vx = clamp(pl.vx, -PHYS.maxMoveSpeed, PHYS.maxMoveSpeed);
+
+    if (pl.vx < -20) pl.face = -1;
+    else if (pl.vx > 20) pl.face = 1;
+
+    // jump with coyote + buffer
+    if (pl.jumpBuffer > 0 && (pl.onGround || pl.coyote > 0)) {
+      pl.vy = -PHYS.jumpVel;
+      pl.onGround = false;
+      pl.groundId = null;
+      pl.coyote = 0;
+      pl.jumpBuffer = 0;
+      pl.vx += (right - left) * 18;
+    }
+
+    // gravity
+    pl.vy += PHYS.gravity * dt;
+
+    // integrate
+    const prevY = pl.y;
+    const prevBottom = prevY + pl.h;
+
+    pl.x += pl.vx * dt;
+    pl.y += pl.vy * dt;
+
+    // horizontal wrap
+    if (pl.x < -pl.w) pl.x = innerWidth + pl.w;
+    if (pl.x > innerWidth + pl.w) pl.x = -pl.w;
+
+    // moving platforms
+    for (const p of state.platforms) {
+      if (p.kind === "moving") {
+        p.x += p.vx * dt;
+        if (p.x < p.minX) { p.x = p.minX; p.vx *= -1; }
+        if (p.x > p.maxX) { p.x = p.maxX; p.vx *= -1; }
+      }
+    }
+
+    // one-way platform collision: only land when falling and crossing top
+    pl.onGround = false;
+    pl.groundId = null;
+
+    if (pl.vy >= 0) {
+      const bottom = pl.y + pl.h;
+      for (const p of state.platforms) {
+        if (pl.x + pl.w <= p.x || pl.x >= p.x + p.w) continue;
+
+        const top = p.y;
+        const crossedTop = (prevBottom <= top && bottom >= top);
+        if (crossedTop) {
+          pl.y = top - pl.h;
+          pl.vy = 0;
+          pl.onGround = true;
+          pl.groundId = p.id;
+          pl.coyote = PHYS.coyoteTime;
+          break;
+        }
+      }
+    }
+
+    // carry by moving platform if standing on it
+    if (pl.onGround && pl.groundId) {
+      const gp = state.platforms.find(pp => pp.id === pl.groundId);
+      if (gp && gp.kind === "moving") pl.x += gp.vx * dt;
+    }
+    if (pl.onGround) pl.coyote = PHYS.coyoteTime;
+
+    // update bugs
+    for (const b of state.bugs) {
+      const p = state.platforms.find(pp => pp.id === b.pId);
+      if (!p) continue;
+
+      b.y = p.y - b.h;
+      b.x += b.dir * b.speed * dt;
+
+      const leftEdge = p.x + 6;
+      const rightEdge = p.x + p.w - b.w - 6;
+      if (b.x < leftEdge) { b.x = leftEdge; b.dir = 1; }
+      if (b.x > rightEdge) { b.x = rightEdge; b.dir = -1; }
+
+      b.wiggle += dt * 6.5;
+    }
+
+    // collect tokens
+    for (let i = state.tokens.length - 1; i >= 0; i--) {
+      const t = state.tokens[i];
+      t.wob += dt * 4.5;
+      const tx = t.x;
+      const ty = t.y + Math.sin(t.wob) * 3;
+
+      const cx = clamp(tx, pl.x, pl.x + pl.w);
+      const cy = clamp(ty, pl.y, pl.y + pl.h);
+      const dx = tx - cx;
+      const dy = ty - cy;
+
+      if (dx*dx + dy*dy <= (t.r + 2)*(t.r + 2)) {
+        state.score += TOKENS.score;
+        state.tokens.splice(i, 1);
+      }
+    }
+
+    // bug collision
+    if (pl.invuln <= 0 && pl.respawnInvuln <= 0) {
+      for (const b of state.bugs) {
+        if (aabb(pl.x, pl.y, pl.w, pl.h, b.x, b.y, b.w, b.h)) {
+          takeHit(false, b);
+          break;
+        }
+      }
+    }
+
+    // altitude
+    state.minPlayerY = Math.min(state.minPlayerY, pl.y);
+
+    // camera follow (soft)
+    const desired = pl.y - innerHeight * 0.42;
+    state.cameraY = lerp(state.cameraY, desired, 1 - Math.pow(0.0008, dt * 60));
+
+    // FALL-DEATH below start zone
+    if (pl.y > START_DEATH_Y) {
+      takeHit(true, null);
+    }
+
+    // generate / cull
+    generateAbove();
+    cullBelow();
+
+    pressed.clear();
+  }
+
+  // =========================
+  // Rendering
+  // =========================
+  function draw() {
+    const w = innerWidth;
+    const h = innerHeight;
+
+    drawTechBackground(w, h);
+
+    // world transform
+    ctx.save();
+    ctx.translate(0, -state.cameraY);
+
+    for (const p of state.platforms) drawPlatform(p);
+    for (const t of state.tokens) drawToken(t);
+    for (const b of state.bugs) drawBug(b);
+
+    drawGorilla(state.player);
+
+    ctx.restore();
+
+    drawHUD(w, h);
+
+    if (state.gameOver) drawGameOver(w, h);
+  }
+
+  function drawTechBackground(w, h) {
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, "#06070a");
+    g.addColorStop(1, "#0b0e16");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+
+    const par = state.cameraY * 0.18;
+    const gridSize = 52;
+
+    ctx.save();
+    ctx.globalAlpha = 0.22;
+    ctx.strokeStyle = "#1a2030";
+    ctx.lineWidth = 1;
+
+    const offsetY = (par % gridSize);
+    const offsetX = (par * 0.55 % gridSize);
+
+    for (let x = -gridSize; x < w + gridSize; x += gridSize) {
+      ctx.beginPath();
+      ctx.moveTo(x + offsetX, 0);
+      ctx.lineTo(x + offsetX, h);
+      ctx.stroke();
+    }
+    for (let y = -gridSize; y < h + gridSize; y += gridSize) {
+      ctx.beginPath();
+      ctx.moveTo(0, y + offsetY);
+      ctx.lineTo(w, y + offsetY);
+      ctx.stroke();
+    }
+
+    ctx.globalAlpha = 0.16;
+    ctx.strokeStyle = ACCENT;
+    ctx.lineWidth = 2;
+    for (let i=0;i<6;i++){
+      const yy = (i*0.18 + 0.1) * h + Math.sin(state.t*0.4 + i)*10;
+      ctx.beginPath();
+      ctx.moveTo(0, yy);
+      ctx.bezierCurveTo(w*0.25, yy-40, w*0.55, yy+30, w, yy-10);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    ctx.save();
+    const drift = state.t * 12;
+    for (const n of state.nodes) {
+      const yy = (n.y + ((-state.cameraY)*0.06) - drift*(1/n.s)) % (h + 80);
+      const y = yy < -40 ? yy + (h + 80) : yy;
+      const x = (n.x + Math.sin(state.t*0.25 + n.s)*8) % w;
+
+      drawGlowCircle(x, y, n.r, n.c, 14, 0.75);
+
+      if (chance(0.02)) {
+        ctx.globalAlpha = 0.25;
+        ctx.strokeStyle = n.c;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + rand(-120,120), y + rand(-90,90));
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+    ctx.restore();
+
+    ctx.save();
+    const vg = ctx.createRadialGradient(w/2, h/2, Math.min(w,h)*0.2, w/2, h/2, Math.max(w,h)*0.75);
+    vg.addColorStop(0, "rgba(0,0,0,0)");
+    vg.addColorStop(1, "rgba(0,0,0,0.55)");
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, w, h);
+    ctx.restore();
+  }
+
+  function drawPlatform(p) {
+    const x = p.x, y = p.y;
+
+    ctx.save();
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = "#000";
+    roundedRectPath(x+2, y+8, p.w, p.h, 10);
+    ctx.fill();
+    ctx.restore();
+
+    const grad = ctx.createLinearGradient(x, y, x+p.w, y+p.h);
+    grad.addColorStop(0, "#1a2333");
+    grad.addColorStop(1, "#0f1420");
+    ctx.fillStyle = grad;
+    roundedRectPath(x, y, p.w, p.h, 10);
+    ctx.fill();
+
+    ctx.save();
+    ctx.globalAlpha = 0.9;
+    ctx.strokeStyle = (p.kind === "moving") ? GOOGLE.blue : ACCENT;
+    ctx.lineWidth = 2;
+    roundedRectPath(x+1, y+1, p.w-2, p.h-2, 9);
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalAlpha = 0.8;
+    const pinCount = Math.max(2, Math.floor(p.w / 120));
+    for (let i=0; i<pinCount; i++) {
+      const px = x + (i+0.5) * (p.w / pinCount);
+      drawGlowCircle(px, y + p.h/2, 2.2, [GOOGLE.green, GOOGLE.yellow, GOOGLE.red][i%3], 10, 0.9);
+    }
+    ctx.restore();
+  }
+
+  function drawToken(t) {
+    const wobY = Math.sin(t.wob) * 3;
+    const x = t.x, y = t.y + wobY;
+
+    ctx.save();
+    ctx.globalAlpha = 0.9;
+    ctx.shadowColor = t.c;
+    ctx.shadowBlur = 18;
+    ctx.strokeStyle = t.c;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(x, y, t.r+2, 0, Math.PI*2);
+    ctx.stroke();
+
+    const g = ctx.createRadialGradient(x-3, y-4, 2, x, y, t.r+4);
+    g.addColorStop(0, "rgba(255,255,255,0.8)");
+    g.addColorStop(1, t.c);
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(x, y, t.r, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = "#101318";
+    ctx.beginPath();
+    ctx.arc(x + t.r*0.25, y, t.r*0.35, -0.7, 0.7);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawBug(b) {
+    const x = b.x, y = b.y;
+    const wig = Math.sin(b.wiggle) * 2.2;
+
+    ctx.save();
+    ctx.globalAlpha = 0.3;
+    ctx.fillStyle = "#000";
+    roundedRectPath(x+2, y+8, b.w, b.h, 10);
+    ctx.fill();
+
+    const grad = ctx.createLinearGradient(x, y, x+b.w, y+b.h);
+    grad.addColorStop(0, "#2a2f3b");
+    grad.addColorStop(1, "#141824");
+    ctx.fillStyle = grad;
+    roundedRectPath(x, y, b.w, b.h, 10);
+    ctx.fill();
+
+    ctx.globalAlpha = 0.9;
+    ctx.strokeStyle = GOOGLE.red;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x + 7, y + b.h/2 + wig*0.2);
+    ctx.lineTo(x + b.w - 7, y + b.h/2 - wig*0.2);
+    ctx.stroke();
+
+    drawGlowCircle(x + 10, y + 8 + wig*0.25, 2.6, GOOGLE.yellow, 10, 0.9);
+    drawGlowCircle(x + 18, y + 8 - wig*0.25, 2.6, GOOGLE.yellow, 10, 0.9);
+
+    ctx.globalAlpha = 0.55;
+    ctx.strokeStyle = "#586173";
+    ctx.lineWidth = 2;
+    for (let i=0; i<3; i++){
+      const lx = x + 6 + i*10;
+      ctx.beginPath();
+      ctx.moveTo(lx, y + b.h - 4);
+      ctx.lineTo(lx - 6, y + b.h + 6 + wig);
+      ctx.stroke();
+
+      const rx = x + b.w - 6 - i*10;
+      ctx.beginPath();
+      ctx.moveTo(rx, y + b.h - 4);
+      ctx.lineTo(rx + 6, y + b.h + 6 - wig);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  // =========================
+  // Gorilla (vector, subtle stroke)
+  // =========================
+  function drawGorilla(pl) {
+    const x = pl.x, y = pl.y;
+
+    ctx.save();
+
+    // invuln blink
+    if ((pl.invuln > 0 || pl.respawnInvuln > 0) && Math.floor(state.t * 14) % 2 === 0) {
+      ctx.globalAlpha = 0.35;
+    }
+
+    // shadow
+    ctx.save();
+    ctx.globalAlpha *= 0.60;
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.beginPath();
+    ctx.ellipse(x + pl.w/2, y + pl.h + 10, pl.w*0.72, 10, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+
+    // flinch transform
+    const fl = (pl.hitStun > 0) ? (pl.hitStun / HIT.stun) : 0;
+    const hitDir = pl.hitDir || 1;
+    const tilt  = (-0.14) * fl * hitDir;
+    const shove = (-8)    * fl * hitDir;
+
+    const bob = Math.sin(state.t * 10) * (pl.onGround ? 0.8 : 0.3);
+
+    const ax = x + pl.w * 0.5;
+    const ay = y + pl.h;
+
+    ctx.translate(ax, ay + bob);
+    ctx.scale(pl.face || 1, 1);
+    ctx.translate(shove, 0);
+    ctx.rotate(tilt);
+
+    // local sprite space
+    const SW = 80, SH = 92;
+    const drawW = pl.w * 1.70;
+    const drawH = pl.h * 1.95;
+    const s = Math.min(drawW / SW, drawH / SH);
+
+    ctx.scale(s, s);
+    ctx.translate(-SW / 2, -SH);
+
+    // Keep outline consistent in SCREEN pixels by dividing by scale
+    const lwPx = (px) => px / s;
+
+    const ST = GOR.strokeColor;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+
+    function rr(rx, ry, rw, rh, r, fill, alpha=1) {
+      ctx.save();
+      ctx.globalAlpha *= alpha;
+      roundedRectPath(rx, ry, rw, rh, r);
+      ctx.fillStyle = fill;
+      ctx.fill();
+      // very subtle outline
+      ctx.strokeStyle = ST;
+      ctx.lineWidth = lwPx(GOR_STROKE_PX);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function ell(cx, cy, rx, ry, rot, fill, alpha=1) {
+      ctx.save();
+      ctx.globalAlpha *= alpha;
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, rx, ry, rot, 0, Math.PI*2);
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = ST;
+      ctx.lineWidth = lwPx(GOR_STROKE_PX);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // back leg
+    rr(33, 54, 16, 30, 10, GOR.fur2, 0.98);
+    rr(31, 82, 22, 10,  7, GOR.hi2, 0.98);
+
+    // back arm
+    rr(16, 34, 18, 32, 11, GOR.fur2, 0.98);
+    rr(12, 62, 26, 12,  8, GOR.hi2, 0.98);
+
+    // torso
+    rr(26, 24, 34, 46, 16, GOR.fur, 1);
+
+    // chest highlight
+    ctx.save();
+    ctx.globalAlpha *= 0.95;
+    const chestG = ctx.createLinearGradient(30, 32, 56, 66);
+    chestG.addColorStop(0, GOR.hi);
+    chestG.addColorStop(1, GOR.face);
+    roundedRectPath(32, 34, 22, 30, 12);
+    ctx.fillStyle = chestG;
+    ctx.fill();
+    ctx.strokeStyle = ST;
+    ctx.lineWidth = lwPx(GOR_STROKE_PX);
+    ctx.stroke();
+    ctx.restore();
+
+    // head
+    ell(43, 16, 16, 14, -0.06, GOR.fur, 1);
+
+    // face patch
+    rr(32, 16, 22, 15, 8, GOR.face, 0.98);
+
+    // brow line (slightly darker)
+    ctx.save();
+    ctx.globalAlpha *= 0.55;
+    ctx.strokeStyle = "rgba(0,0,0,0.55)";
+    ctx.lineWidth = lwPx(Math.max(1.0, GOR_STROKE_PX * 0.9));
+    ctx.beginPath();
+    ctx.moveTo(34, 18);
+    ctx.quadraticCurveTo(43, 14, 52, 18);
+    ctx.stroke();
+    ctx.restore();
+
+    // eyes
+    ctx.save();
+    ctx.shadowColor = ACCENT;
+    ctx.shadowBlur = 10;
+    ctx.fillStyle = ACCENT;
+    ctx.beginPath(); ctx.ellipse(39, 23, 3.2, 2.4, -0.12, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(47, 23, 3.2, 2.4,  0.12, 0, Math.PI*2); ctx.fill();
+
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = GOR.eyeHot;
+    ctx.beginPath(); ctx.arc(40.3, 22.4, 1.0, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(48.3, 22.4, 1.0, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+
+    // mouth/nose
+    ctx.save();
+    ctx.globalAlpha *= 0.45;
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    roundedRectPath(37, 28, 12, 6, 4);
+    ctx.fill();
+    ctx.restore();
+
+    // front leg
+    rr(52, 54, 16, 34, 10, GOR.fur, 1);
+    rr(50, 84, 26, 10,  7, GOR.hi2, 1);
+
+    // front arm
+    rr(54, 36, 18, 34, 11, GOR.fur, 1);
+    rr(52, 64, 26, 12,  8, GOR.hi2, 1);
+
+    // shoulder patch
+    ctx.save();
+    ctx.globalAlpha *= 0.9;
+    ctx.beginPath();
+    ctx.ellipse(57, 35, 10, 7, -0.25, 0, Math.PI*2);
+    ctx.fillStyle = GOR.hi;
+    ctx.fill();
+    ctx.strokeStyle = ST;
+    ctx.lineWidth = lwPx(GOR_STROKE_PX);
+    ctx.stroke();
+    ctx.restore();
+
+    // sheen line
+    ctx.save();
+    ctx.globalAlpha *= 0.18;
+    ctx.strokeStyle = "rgba(255,255,255,0.7)";
+    ctx.lineWidth = lwPx(Math.max(1.0, GOR_STROKE_PX));
+    ctx.beginPath();
+    ctx.moveTo(33, 42);
+    ctx.quadraticCurveTo(43, 37, 55, 43);
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.restore();
+  }
+
+  // =========================
+  // HUD / UI
+  // =========================
+  function drawHUD(w, h) {
+    const meters = currentMeters();
+    const L = currentLevel();
+    const prog = levelProgress();
+
+    ctx.save();
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = "rgba(10,12,18,0.72)";
+    roundedRectPath(14, 14, 360, 152, 18);
+    ctx.fill();
+
+    ctx.globalAlpha = 0.9;
+    ctx.strokeStyle = "rgba(233,88,5,0.55)";
+    ctx.lineWidth = 2;
+    roundedRectPath(14, 14, 360, 152, 18);
+    ctx.stroke();
+
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#e9edf6";
+    ctx.font = "700 16px ui-sans-serif, system-ui";
+    ctx.fillText("Silverback SERP Climb", 28, 42);
+
+    ctx.font = "600 13px ui-sans-serif, system-ui";
+    ctx.fillStyle = "rgba(233,237,246,0.88)";
+    ctx.fillText(`Altitude: ${meters.toLocaleString()} m`, 28, 66);
+    ctx.fillText(`Score: ${state.score.toLocaleString()}`, 28, 86);
+    ctx.fillText(`SERP Level: ${L}`, 28, 106);
+
+    ctx.font = "700 12px ui-sans-serif, system-ui";
+    ctx.fillStyle = "rgba(233,237,246,0.85)";
+    ctx.fillText("Hearts:", 210, 66);
+
+    for (let i=0; i<GAME.heartsPerLife; i++){
+      const hx = 270 + i*18;
+      const hy = 60;
+      const alive = i < state.hearts;
+      ctx.save();
+      ctx.globalAlpha = alive ? 1 : 0.25;
+      drawGlowCircle(hx, hy, 6.5, alive ? GOOGLE.red : "#394052", 14, 0.85);
+      ctx.restore();
+    }
+
+    ctx.fillStyle = "rgba(233,237,246,0.85)";
+    ctx.fillText("Lives:", 210, 94);
+
+    for (let i=0; i<GAME.startLives; i++){
+      const lx = 270 + i*18;
+      const ly = 88;
+      const alive = i < state.lives;
+      ctx.save();
+      ctx.globalAlpha = alive ? 1 : 0.25;
+      drawGlowCircle(lx, ly, 6.5, alive ? GOOGLE.yellow : "#394052", 14, 0.85);
+      ctx.restore();
+    }
+
+    const bx = 210, by = 116, bw = 122, bh = 12;
+    ctx.save();
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = "rgba(255,255,255,0.08)";
+    roundedRectPath(bx, by, bw, bh, 8);
+    ctx.fill();
+
+    const fillW = bw * clamp(prog, 0, 1);
+    const barG = ctx.createLinearGradient(bx, by, bx+bw, by);
+    barG.addColorStop(0, GOOGLE.blue);
+    barG.addColorStop(0.33, GOOGLE.red);
+    barG.addColorStop(0.66, GOOGLE.yellow);
+    barG.addColorStop(1, GOOGLE.green);
+
+    ctx.fillStyle = barG;
+    roundedRectPath(bx, by, Math.max(10, fillW), bh, 8);
+    ctx.fill();
+
+    ctx.globalAlpha = 0.9;
+    ctx.strokeStyle = "rgba(233,88,5,0.5)";
+    ctx.lineWidth = 1.5;
+    roundedRectPath(bx, by, bw, bh, 8);
+    ctx.stroke();
+
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = "rgba(233,237,246,0.85)";
+    ctx.font = "600 11px ui-sans-serif, system-ui";
+    ctx.fillText(`Next: ${(LEVEL_EVERY_METERS - (meters % LEVEL_EVERY_METERS))}m`, bx, by + 26);
+
+    ctx.restore();
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = "rgba(10,12,18,0.55)";
+    roundedRectPath(14, h - 52, 370, 38, 14);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.lineWidth = 1;
+    roundedRectPath(14, h - 52, 370, 38, 14);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(233,237,246,0.86)";
+    ctx.font = "600 13px ui-sans-serif, system-ui";
+    ctx.fillText("Move: A/D or ◀/▶   Jump: Space or W/▲   Restart: R", 28, h - 28);
+    ctx.restore();
+  }
+
+  function drawGameOver(w, h) {
+    ctx.save();
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillRect(0, 0, w, h);
+
+    const pw = Math.min(560, w - 60);
+    const ph = 230;
+    const px = (w - pw) / 2;
+    const py = (h - ph) / 2;
+
+    ctx.globalAlpha = 0.95;
+    ctx.fillStyle = "rgba(12,14,20,0.9)";
+    roundedRectPath(px, py, pw, ph, 22);
+    ctx.fill();
+
+    ctx.strokeStyle = "rgba(233,88,5,0.75)";
+    ctx.lineWidth = 2;
+    roundedRectPath(px, py, pw, ph, 22);
+    ctx.stroke();
+
+    ctx.fillStyle = "#e9edf6";
+    ctx.font = "800 34px ui-sans-serif, system-ui";
+    ctx.fillText("GAME OVER", px + 32, py + 70);
+
+    ctx.font = "600 15px ui-sans-serif, system-ui";
+    ctx.fillStyle = "rgba(233,237,246,0.9)";
+    ctx.fillText(`Final Altitude: ${currentMeters().toLocaleString()} m`, px + 32, py + 110);
+    ctx.fillText(`Final Score: ${state.score.toLocaleString()}`, px + 32, py + 135);
+
+    ctx.fillStyle = "rgba(233,237,246,0.86)";
+    ctx.font = "700 15px ui-sans-serif, system-ui";
+    ctx.fillText("Press R to restart", px + 32, py + 185);
+
+    drawGlowCircle(px + pw - 44, py + 46, 5, GOOGLE.blue, 14, 0.9);
+    drawGlowCircle(px + pw - 28, py + 46, 5, GOOGLE.red, 14, 0.9);
+    drawGlowCircle(px + pw - 12, py + 46, 5, GOOGLE.yellow, 14, 0.9);
+
+    ctx.restore();
+  }
+
+  // =========================
+  // Main loop
+  // =========================
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+
+    if (wasPressed("r")) resetGame();
+
+    if (!state.gameOver) update(dt);
+    else pressed.clear();
+
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  // Boot
+  resetGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
