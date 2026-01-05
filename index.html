@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Silverback SERP Climb (Reachable Platforms + Subtle Stroke + Fall Death)</title>
+  <title>Silverback SERP Climb (Reachable Platforms Fix)</title>
   <style>
     html, body {
       margin: 0;
@@ -51,8 +51,7 @@
     jumpBuffer: 0.10,
   };
 
-  // "Die if you fall below the starting zone"
-  // Starter platforms live around y≈20. If you drop well below that, you get punished.
+  // Die if you fall below the starting zone
   const START_DEATH_Y = 300; // world y (positive is down)
 
   // =========================
@@ -63,9 +62,10 @@
     minPlatformW: 160,
     maxPlatformW: 380,
 
-    // Reachability clamps: keeps gen from producing impossible jumps
-    minGapY: 86,
-    maxGapY: 142,          // MUST be <= jump height (~176px); keep some buffer
+    // Reachability targets (SAFE cap computed dynamically below)
+    minGapY: 78,
+    maxGapY: 132,
+
     spawnAhead: 1400,
     cullBelow: 900,
   };
@@ -98,12 +98,10 @@
   };
 
   // =========================
-  // Gorilla styling (SUBTLE gray outline)
+  // Gorilla styling (very subtle gray outline)
   // =========================
   const GOR = {
-    // subtle gray outline (not white, low alpha)
     strokeColor: "rgba(170,175,185,0.35)",
-
     fur:     "#0a0b10",
     fur2:    "#141723",
     hi:      "#6b70b8",
@@ -111,9 +109,6 @@
     face:    "#9aa0ff",
     eyeHot:  "#ffd38a",
   };
-
-  // Set this to "almost nothing"
-  // Try 0.6, 0.8, 1.0, 1.2
   const GOR_STROKE_PX = 0.9;
 
   // =========================
@@ -259,10 +254,10 @@
     addPlatform(innerWidth * 0.20 - 120, baseY - 530, 240, "static");
     addPlatform(innerWidth * 0.72 - 150, baseY - 660, 300, "static");
 
-    // sprinkle tokens
+    // Sprinkle tokens
     for (let i = 0; i < 8; i++) spawnTokenNearTop();
 
-    // seed a couple bugs
+    // Seed a couple bugs
     maybeSpawnBugOnPlatform(state.platforms[2], 1);
     maybeSpawnBugOnPlatform(state.platforms[4], 1);
 
@@ -319,7 +314,7 @@
   function highestPlatform() {
     let best = null;
     for (const p of state.platforms) {
-      if (!best || p.y < best.y) best = p; // smallest y = highest up
+      if (!best || p.y < best.y) best = p;
     }
     return best;
   }
@@ -352,38 +347,36 @@
     });
   }
 
-  // Compute time to reach a higher platform at vertical gap dy (positive px upward)
-  // Using y(t) = -jumpVel*t + 0.5*g*t^2, solve for y = -dy.
+  // Time to reach a platform height dy (px upward) on the way DOWN (safer for land detection)
   function timeToHeightDescending(dy) {
     const g = PHYS.gravity;
     const v = PHYS.jumpVel;
     const disc = v*v - 2*g*dy;
-    if (disc <= 0) return null; // unreachable
-    const sqrt = Math.sqrt(disc);
-    // t2 is the later time (descending through that height)
-    return (v + sqrt) / g;
+    if (disc <= 0) return null;
+    return (v + Math.sqrt(disc)) / g;
   }
 
   function generateAbove() {
     const d = difficulty();
     const L = currentLevel();
 
-    // platform widths shrink gently with difficulty
+    // widths shrink gently
     const widthMin = Math.max(110, WORLD.minPlatformW - (d-1) * 14);
     const widthMax = Math.max(180, WORLD.maxPlatformW - (d-1) * 18);
 
-    // vertical gaps increase a bit, but CLAMPED to remain jumpable
-    const gapMax = clamp(WORLD.maxGapY + (d-1) * 6, WORLD.maxGapY, 152);
-    const gapMin = clamp(WORLD.minGapY + (d-1) * 2, WORLD.minGapY, 110);
+    // ====== NEW: dynamic SAFE vertical cap derived from physics ======
+    const JUMP_APEX = (PHYS.jumpVel * PHYS.jumpVel) / (2 * PHYS.gravity); // ~176px with current phys
+    const CLEARANCE = 28; // margin so player clearly crosses the top while falling
+    const SAFE_MAX_GAP = Math.max(WORLD.minGapY + 20, JUMP_APEX - CLEARANCE); // ~148px
 
-    // moving platforms increase, but still mild
+    const gapMax = Math.min(SAFE_MAX_GAP, WORLD.maxGapY + (d - 1) * 4);
+    const gapMin = Math.min(gapMax - 14, WORLD.minGapY + (d - 1) * 2);
+    // ===============================================================
+
     const movingChance = clamp(0.04 + (L-1) * 0.010, 0.04, 0.26);
 
-    // token density decreases a bit
     const tokenChance = clamp(0.65 - (d-1)*0.11, 0.22, 0.65);
-
-    // bug frequency increases
-    const bugChance = clamp(0.18 + (d-1)*0.09, 0.18, 0.70);
+    const bugChance   = clamp(0.18 + (d-1)*0.09, 0.18, 0.70);
 
     let anchor = highestPlatform();
     if (!anchor) return;
@@ -394,21 +387,18 @@
     const targetY = state.cameraY - WORLD.spawnAhead;
 
     while (y > targetY) {
-      // choose a reachable vertical gap
-      const dy = rand(gapMin, gapMax); // px upward (world y decreases)
+      // choose a reachable vertical gap (hard-capped)
+      const dy = rand(gapMin, gapMax);
       y -= dy;
 
-      // compute a safe horizontal reach for THIS dy
+      // compute safe horizontal reach for THIS dy
       const tDesc = timeToHeightDescending(dy);
-      // if something weird happens, fall back to conservative distance
       const maxDx = tDesc
-        ? (PHYS.maxMoveSpeed * 0.86) * tDesc + 40   // some slack
-        : 260;
+        ? (PHYS.maxMoveSpeed * 0.86) * tDesc + 40
+        : 240;
 
-      // choose platform width
       const w = rand(widthMin, widthMax);
 
-      // pick next center x near previous, within reachable dx
       const nextCx = clamp(
         cx + rand(-maxDx*0.75, maxDx*0.75),
         18 + w*0.5,
@@ -420,7 +410,6 @@
       const kind = (L >= 3 && chance(movingChance)) ? "moving" : "static";
       const p = addPlatform(x, y, w, kind);
 
-      // tokens
       if (chance(tokenChance)) {
         const n = randi(1, chance(0.22) ? 5 : 3);
         for (let i=0; i<n; i++) {
@@ -431,12 +420,11 @@
         }
       }
 
-      // bugs
       if (p.w >= bugMinPlatformWidth() && chance(bugChance)) {
         maybeSpawnBugOnPlatform(p, d);
       }
 
-      // occasional “step” platform (also constrained)
+      // occasional step platform (also hard-capped)
       if (chance(0.20)) {
         const dy2 = rand(gapMin*0.55, gapMax*0.75);
         const t2 = timeToHeightDescending(dy2) || 0.55;
@@ -450,6 +438,7 @@
           18 + w2*0.5,
           innerWidth - 18 - w2*0.5
         );
+
         const x2 = cx2 - w2*0.5;
 
         const kind2 = (L >= 4 && chance(movingChance*0.80)) ? "moving" : "static";
@@ -462,7 +451,6 @@
           maybeSpawnBugOnPlatform(p2, d);
         }
 
-        // continue from the highest of the two we just made
         if (p2.y < p.y) {
           y = p2.y;
           cx = cx2;
@@ -520,7 +508,6 @@
       if (state.hearts > 0) return;
     }
 
-    // lose a life
     state.lives -= 1;
 
     if (state.lives <= 0) {
@@ -530,7 +517,6 @@
 
     state.hearts = GAME.heartsPerLife;
 
-    // respawn near checkpoint
     const targetY = state.checkpointY;
     const candidates = state.platforms
       .filter(p => p.y > targetY - 420 && p.y < targetY + 420)
@@ -549,7 +535,6 @@
     pl.groundId = null;
     pl.coyote = 0;
 
-    // snap camera to player so you don't stare into void
     state.cameraY = pl.y - innerHeight * 0.42;
 
     generateAbove();
@@ -634,7 +619,7 @@
       }
     }
 
-    // one-way platform collision: only land when falling and crossing top
+    // one-way platform collision
     pl.onGround = false;
     pl.groundId = null;
 
@@ -656,7 +641,7 @@
       }
     }
 
-    // carry by moving platform if standing on it
+    // carry by moving platform
     if (pl.onGround && pl.groundId) {
       const gp = state.platforms.find(pp => pp.id === pl.groundId);
       if (gp && gp.kind === "moving") pl.x += gp.vx * dt;
@@ -710,7 +695,7 @@
     // altitude
     state.minPlayerY = Math.min(state.minPlayerY, pl.y);
 
-    // camera follow (soft)
+    // camera follow
     const desired = pl.y - innerHeight * 0.42;
     state.cameraY = lerp(state.cameraY, desired, 1 - Math.pow(0.0008, dt * 60));
 
@@ -719,7 +704,6 @@
       takeHit(true, null);
     }
 
-    // generate / cull
     generateAbove();
     cullBelow();
 
@@ -735,7 +719,6 @@
 
     drawTechBackground(w, h);
 
-    // world transform
     ctx.save();
     ctx.translate(0, -state.cameraY);
 
@@ -748,7 +731,6 @@
     ctx.restore();
 
     drawHUD(w, h);
-
     if (state.gameOver) drawGameOver(w, h);
   }
 
@@ -947,7 +929,6 @@
 
     ctx.save();
 
-    // invuln blink
     if ((pl.invuln > 0 || pl.respawnInvuln > 0) && Math.floor(state.t * 14) % 2 === 0) {
       ctx.globalAlpha = 0.35;
     }
@@ -966,7 +947,6 @@
     const hitDir = pl.hitDir || 1;
     const tilt  = (-0.14) * fl * hitDir;
     const shove = (-8)    * fl * hitDir;
-
     const bob = Math.sin(state.t * 10) * (pl.onGround ? 0.8 : 0.3);
 
     const ax = x + pl.w * 0.5;
@@ -977,7 +957,6 @@
     ctx.translate(shove, 0);
     ctx.rotate(tilt);
 
-    // local sprite space
     const SW = 80, SH = 92;
     const drawW = pl.w * 1.70;
     const drawH = pl.h * 1.95;
@@ -986,7 +965,6 @@
     ctx.scale(s, s);
     ctx.translate(-SW / 2, -SH);
 
-    // Keep outline consistent in SCREEN pixels by dividing by scale
     const lwPx = (px) => px / s;
 
     const ST = GOR.strokeColor;
@@ -999,7 +977,6 @@
       roundedRectPath(rx, ry, rw, rh, r);
       ctx.fillStyle = fill;
       ctx.fill();
-      // very subtle outline
       ctx.strokeStyle = ST;
       ctx.lineWidth = lwPx(GOR_STROKE_PX);
       ctx.stroke();
@@ -1019,18 +996,14 @@
       ctx.restore();
     }
 
-    // back leg
     rr(33, 54, 16, 30, 10, GOR.fur2, 0.98);
     rr(31, 82, 22, 10,  7, GOR.hi2, 0.98);
 
-    // back arm
     rr(16, 34, 18, 32, 11, GOR.fur2, 0.98);
     rr(12, 62, 26, 12,  8, GOR.hi2, 0.98);
 
-    // torso
     rr(26, 24, 34, 46, 16, GOR.fur, 1);
 
-    // chest highlight
     ctx.save();
     ctx.globalAlpha *= 0.95;
     const chestG = ctx.createLinearGradient(30, 32, 56, 66);
@@ -1044,13 +1017,9 @@
     ctx.stroke();
     ctx.restore();
 
-    // head
     ell(43, 16, 16, 14, -0.06, GOR.fur, 1);
-
-    // face patch
     rr(32, 16, 22, 15, 8, GOR.face, 0.98);
 
-    // brow line (slightly darker)
     ctx.save();
     ctx.globalAlpha *= 0.55;
     ctx.strokeStyle = "rgba(0,0,0,0.55)";
@@ -1061,7 +1030,6 @@
     ctx.stroke();
     ctx.restore();
 
-    // eyes
     ctx.save();
     ctx.shadowColor = ACCENT;
     ctx.shadowBlur = 10;
@@ -1075,7 +1043,6 @@
     ctx.beginPath(); ctx.arc(48.3, 22.4, 1.0, 0, Math.PI*2); ctx.fill();
     ctx.restore();
 
-    // mouth/nose
     ctx.save();
     ctx.globalAlpha *= 0.45;
     ctx.fillStyle = "rgba(0,0,0,0.55)";
@@ -1083,15 +1050,12 @@
     ctx.fill();
     ctx.restore();
 
-    // front leg
     rr(52, 54, 16, 34, 10, GOR.fur, 1);
     rr(50, 84, 26, 10,  7, GOR.hi2, 1);
 
-    // front arm
     rr(54, 36, 18, 34, 11, GOR.fur, 1);
     rr(52, 64, 26, 12,  8, GOR.hi2, 1);
 
-    // shoulder patch
     ctx.save();
     ctx.globalAlpha *= 0.9;
     ctx.beginPath();
@@ -1103,7 +1067,6 @@
     ctx.stroke();
     ctx.restore();
 
-    // sheen line
     ctx.save();
     ctx.globalAlpha *= 0.18;
     ctx.strokeStyle = "rgba(255,255,255,0.7)";
@@ -1287,3 +1250,4 @@
 </script>
 </body>
 </html>
+
